@@ -81,8 +81,22 @@ class WorkerManager:
         self.tasks[token] = asyncio.create_task(runner())
         return f"{key}: جاري التشغيل"
 
+    async def stop_worker(self, token: str) -> str:
+        key = mask_token(token)
+        client = self.clients.pop(token, None)
+        task = self.tasks.pop(token, None)
+        if client and not client.is_closed():
+            await client.close()
+        if task and not task.done():
+            task.cancel()
+        return f"{key}: تم الإيقاف"
+
     async def sync_all(self, tokens: List[str]) -> List[str]:
         results = []
+        active_set = set(tokens)
+        for existing in list(self.clients.keys()):
+            if existing not in active_set:
+                results.append(await self.stop_worker(existing))
         for token in tokens:
             results.append(await self.start_worker(token))
         return results
@@ -138,6 +152,8 @@ class MasterBot(commands.Bot):
     async def close(self) -> None:
         if self.sender_task and not self.sender_task.done():
             self.sender_task.cancel()
+        for t in list(self.worker_manager.clients.keys()):
+            await self.worker_manager.stop_worker(t)
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
         await super().close()
@@ -176,7 +192,7 @@ class MasterBot(commands.Bot):
     async def sender_loop(self) -> None:
         default_cfg = {
             "enabled": False,
-            "mode": "webhook",  # webhook | workers | both
+            "mode": "both",  # webhook | workers | both
             "webhooks": [],
             "username": "",
             "channel_id": 0,
@@ -191,7 +207,7 @@ class MasterBot(commands.Bot):
 
             raw_interval = float(cfg.get("interval", 1.0))
             interval = max(MIN_INTERVAL, raw_interval)
-            mode = str(cfg.get("mode", "webhook")).lower()
+            mode = str(cfg.get("mode", "both")).lower()
             content = str(cfg.get("message", "رسالة تلقائية"))
             username = str(cfg.get("username", "")) or None
 
@@ -228,6 +244,63 @@ async def deny_if_unauthorized(interaction: discord.Interaction) -> bool:
     return False
 
 
+# --- أوامر البوتات الفرعية (Workers) ---
+
+@bot.tree.command(name="worker_add", description="إضافة توكن بوت فرعي وتشغيله")
+@app_commands.default_permissions()
+@app_commands.describe(token="توكن البوت الفرعي")
+async def worker_add(interaction: discord.Interaction, token: str):
+    if await deny_if_unauthorized(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    w_data = load_json(WORKERS_FILE, {"tokens": []})
+    tokens = [t.strip() for t in w_data.get("tokens", []) if isinstance(t, str) and t.strip()]
+    clean = token.strip()
+    if clean not in tokens:
+        tokens.append(clean)
+        save_json(WORKERS_FILE, {"tokens": tokens})
+    status = await bot.worker_manager.start_worker(clean)
+    await interaction.followup.send(f"تمت الإضافة: {status}", ephemeral=True)
+
+
+@bot.tree.command(name="worker_remove", description="حذف توكن بوت فرعي وإيقافه")
+@app_commands.default_permissions()
+@app_commands.describe(token="توكن البوت الفرعي المراد حذفه")
+async def worker_remove(interaction: discord.Interaction, token: str):
+    if await deny_if_unauthorized(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    clean = token.strip()
+    w_data = load_json(WORKERS_FILE, {"tokens": []})
+    tokens = [t.strip() for t in w_data.get("tokens", []) if isinstance(t, str) and t.strip()]
+    if clean in tokens:
+        tokens.remove(clean)
+        save_json(WORKERS_FILE, {"tokens": tokens})
+    status = await bot.worker_manager.stop_worker(clean)
+    await interaction.followup.send(f"تمت الإزالة: {status}", ephemeral=True)
+
+
+@bot.tree.command(name="worker_status", description="عرض حالة البوتات الفرعية المسجلة")
+@app_commands.default_permissions()
+async def worker_status(interaction: discord.Interaction):
+    if await deny_if_unauthorized(interaction):
+        return
+    w_data = load_json(WORKERS_FILE, {"tokens": []})
+    tokens = [t.strip() for t in w_data.get("tokens", []) if isinstance(t, str) and t.strip()]
+    if not tokens:
+        await interaction.response.send_message("لا توجد توكنات بوتات فرعية مسجلة.", ephemeral=True)
+        return
+    lines = []
+    for t in tokens:
+        key = mask_token(t)
+        c = bot.worker_manager.clients.get(t)
+        state = "متصل" if (c and c.is_ready()) else "غير متصل"
+        lines.append(f"• `{key}` — {state}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+# --- أوامر الويب هوك (Webhooks) ---
+
 @bot.tree.command(name="webhook_add", description="إضافة رابط Webhook للتوزيع المتوازن")
 @app_commands.default_permissions()
 @app_commands.describe(url="رابط Webhook", username="اسم مرسل (اختياري)")
@@ -246,19 +319,52 @@ async def webhook_add(interaction: discord.Interaction, url: str, username: Opti
     await interaction.response.send_message(f"تمت إضافة الويب هوك ({len(hooks)} إجمالي).", ephemeral=True)
 
 
-@bot.tree.command(name="msg_config", description="تحديد الرسالة والفاصل الزمني بالثواني (مثال: 0.5 أو 1)")
+@bot.tree.command(name="webhook_remove", description="حذف رابط Webhook حسب رقمه في القائمة")
+@app_commands.default_permissions()
+@app_commands.describe(index="رقم الرابط (يبدأ من 1)")
+async def webhook_remove(interaction: discord.Interaction, index: int):
+    if await deny_if_unauthorized(interaction):
+        return
+    cfg = load_json(CONFIG_FILE, {"webhooks": []})
+    hooks = cfg.get("webhooks", [])
+    if index < 1 or index > len(hooks):
+        await interaction.response.send_message(f"الرقم غير صحيح. الحالي: {len(hooks)}", ephemeral=True)
+        return
+    removed = hooks.pop(index - 1)
+    cfg["webhooks"] = hooks
+    save_json(CONFIG_FILE, cfg)
+    await interaction.response.send_message(f"تم حذف الرابط #{index} (`{mask_url(removed)}`).", ephemeral=True)
+
+
+@bot.tree.command(name="webhook_list", description="عرض روابط Webhook المسجلة")
+@app_commands.default_permissions()
+async def webhook_list(interaction: discord.Interaction):
+    if await deny_if_unauthorized(interaction):
+        return
+    cfg = load_json(CONFIG_FILE, {"webhooks": []})
+    hooks = cfg.get("webhooks", [])
+    if not hooks:
+        await interaction.response.send_message("لا توجد روابط Webhook مضافة.", ephemeral=True)
+        return
+    lines = [f"{i + 1}. `{mask_url(u)}`" for i, u in enumerate(hooks)]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+# --- أوامر الإرسال ---
+
+@bot.tree.command(name="msg_config", description="تحديد الرسالة والفاصل والوضع والروم")
 @app_commands.default_permissions()
 @app_commands.describe(
     message="نص الرسالة",
-    interval="الفاصل الزمني بالثواني (مثال: 0.5 أو 1 أو 2.5)",
+    interval="الفاصل الزمني بالثواني (مثال: 0.5 أو 1)",
     mode="webhook أو workers أو both",
-    channel_id="معرف الروم للبوتات الفرعية (اختياري)",
+    channel_id="معرف الروم للبوتات الفرعية",
 )
 async def msg_config(
     interaction: discord.Interaction,
     message: str,
     interval: float = 1.0,
-    mode: str = "webhook",
+    mode: str = "both",
     channel_id: Optional[str] = None,
 ):
     if await deny_if_unauthorized(interaction):
@@ -302,10 +408,13 @@ async def msg_status(interaction: discord.Interaction):
     if await deny_if_unauthorized(interaction):
         return
     cfg = load_json(CONFIG_FILE, {})
+    w_data = load_json(WORKERS_FILE, {"tokens": []})
     text = (
         f"• الحالة: `{'شغال' if cfg.get('enabled') else 'متوقف'}`\n"
         f"• الفاصل: `{cfg.get('interval', 1.0)}s`\n"
-        f"• الوضع: `{cfg.get('mode', 'webhook')}`\n"
+        f"• الوضع: `{cfg.get('mode', 'both')}`\n"
+        f"• روم البوتات الفرعية: `{cfg.get('channel_id', 0)}`\n"
+        f"• عدد البوتات الفرعية: `{len(w_data.get('tokens', []))}`\n"
         f"• عدد Webhooks: `{len(cfg.get('webhooks', []))}`\n"
         f"• الرسالة: {cfg.get('message', '')}"
     )
